@@ -1,0 +1,832 @@
+---
+title: "Covid 19 Data Exporation"
+author: "Derrick Lewis"
+date: "2025-11-23"
+output:
+  html_document:
+    code_folding: hide
+---
+
+```{r install_packages, include=FALSE}
+
+## Uncomment the following to install any additional packages
+# install.packages('details')
+# install.packages('pander')
+# install.packages('plotly')
+# install.packages('kableExtra')
+# install.packages('zoo')
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse, quietly = TRUE, warn.conflicts = FALSE)
+library(lubridate)
+library(ggplot2)
+library(details)
+library(pander)
+library(plotly)
+library(kableExtra)
+library(zoo)
+```
+
+--- 
+
+# Introduction 
+
+This document will examine data related to Covid 19 confirmed cases and deaths in the U.S. Data provided by the Johns Hopkins University Center for Systems Science and Engineering (JHU CSSE).
+More information regarding this data, its sources and caveats can be [found here](https://github.com/CSSEGISandData/COVID-19).
+
+## Exploratory Analysis of COVID-19 Data
+
+The COVID-19 pandemic has generated an unprecedented amount of data. This notebook performs an exploratory data analysis on the time series data compiled by the Center for Systems Science and Engineering (CSSE) at Johns Hopkins University.
+
+The primary goal of this analysis is to process, explore, and visualize the provided datasets for confirmed cases and covid related deaths, both in the US and globally. By doing so, we aim to uncover trends, compare the impact across different regions, and gain a clearer understanding of the pandemic's progression over time. This exploration will serve as a foundation for asking more specific questions and potentially building predictive models.
+
+---
+
+### Data Collection
+
+The data in this repository is stored in separate csv files between confirmed cases and deaths per county.  
+
+Additionally, the data is in a wide format with individual dates as columns. In this initial data load we will also pivot both tables into a "tall" format, coerce `date` columns into an appropriate date datatype, and fix a small issue where the Kansas City FIPS code is missing.
+
+```{r data_load, include = FALSE}
+# ---
+# covid_header <-"https://raw.githubusercontent.com/CSSEGISandData/COVID-19/master/csse_covid_19_data/csse_covid_19_time_series/"
+# covid_file <- "time_series_covid19_confirmed_US.csv"
+# url <- str_c(covid_header, covid_file)
+# confirmed_us_raw <- read_csv("https://raw.githubusercontent.com/CSSEGISandData/COVID-19/master/csse_covid_19_data/csse_covid_19_time_series/time_series_covid19_confirmed_US.csv", show_col_types = FALSE)
+# if(!file.exists('data'))(dir.create('data'))
+# write_csv(confirmed_us_raw, 'data/confirmed_cases.csv')
+# Comment out the above after initial run 
+confirmed_us_raw <- read_csv('data/confirmed_cases.csv', show_col_types = FALSE)
+
+# ---
+# covid_file <- "time_series_covid19_deaths_US.csv"
+# url <- str_c(covid_header, covid_file)
+# deaths_us_raw <- read_csv(url, show_col_types = FALSE)
+# # Kansas City missing its FIPS code, manually add it
+# deaths_us_raw <- deaths_us_raw %>%
+#     mutate(FIPS = ifelse(str_detect(Combined_Key, "Kansas City.*Missouri") & is.na(FIPS), 
+#                          29095,
+#                          FIPS))
+# write_csv(deaths_us_raw, 'data/deaths_us_raw.csv')
+# Coment out the above after initial run 
+deaths_us_raw <- read_csv('data/deaths_us_raw.csv', show_col_types = FALSE)
+```
+
+```{r pivots, echo = FALSE, results = 'asis'}
+cat("--------------------------BEFORE PIVOT---------------------\n\n")
+cat("\t\t\tNumber of rows in the Confirmed Table:", nrow(confirmed_us_raw), "\n\n")
+cat("\t\t\tNumber of columns in the Confirmed Table:", ncol(confirmed_us_raw), "\n\n")
+
+cat("\t\t\tNumber of rows in the Deaths Table:", nrow(deaths_us_raw), "\n\n")
+cat("\t\t\tNumber of columns in the Deaths Table:", ncol(deaths_us_raw), "\n\n")
+
+confirmed_us <- confirmed_us_raw %>%
+    select(-c(UID, iso2, iso3, code3, FIPS, Admin2)) %>%
+    pivot_longer(
+        cols = -c('Province_State', 'Country_Region', 'Lat', 'Long_', 'Combined_Key'),
+        names_to = 'date',
+        values_to = 'cases') %>%
+    select(-c(Lat, Long_))
+
+
+deaths_us <- deaths_us_raw %>%
+    select(-c(UID, iso2, iso3, code3, FIPS, Admin2)) %>%
+    pivot_longer(
+        cols = -c('Province_State', 'Country_Region', 'Lat', 'Long_', 'Combined_Key', 'Population'),
+        names_to = 'date',
+        values_to = 'deaths') %>%
+    select(-c(Lat, Long_))
+
+cat("--------------------------AFTER PIVOT---------------------\n\n")
+cat("\t\t\tNumber of rows in the Confirmed Table:", nrow(confirmed_us), "\n\n")
+cat("\t\t\tNumber of columns in the Confirmed Table:", ncol(confirmed_us), "\n\n")
+
+cat("\t\t\tNumber of rows in the Deaths Table:", nrow(deaths_us), "\n\n")
+cat("\t\t\tNumber of columns in the Deaths Table:", ncol(deaths_us), "\n\n")
+```
+
+**Notice:** There is one additional Column in the `deaths` dataset. This reperesents the population of each county and this will be used in a later join.
+
+---
+
+#### Confirmed Cases by County
+Sample of data after pivot.
+```{r confirmed_cases}
+knitr::kable(tail(confirmed_us), caption = "Confirmed Covid Cases by county")
+```
+
+#### Deaths by County Table
+Sample of data after pivot.
+```{r deaths_cases}
+knitr::kable(tail(deaths_us), caption = "Deaths from Covid by county")
+```
+
+
+#### Population Density Table
+
+In order to use this data to discover statistics regarding how covid effected areas with greater or lesser population density, first we must load a dataset with data on the square land mass per county. 
+
+This we can get from the US Census website as a `.txt` file.
+
+**Issue: New Connecticut County Codes for 2024**
+
+https://www.bls.gov/cew/classifications/areas/new-2024-connecticut-counties.htm
+
+In an attempt to get land mass for Connecticut counties, I found that the county codes were updated for 2024. Given the data is from 2020-2023, It is easier to import the 2021 Gazetteer file and then update the county codes for Connecticut.
+
+```{r census_load, echo=FALSE, results='hide'}
+# result <- download.file(
+#     url = "https://www2.census.gov/geo/docs/maps-data/data/gazetteer/2021_Gazetteer/2021_Gaz_counties_national.zip",
+#     destfile = "data/tmp.zip",
+#     mode = "wb"
+# )
+# # Unzip
+# unzip("data/tmp.zip", exdir = "data/")
+# # Clean up
+# file.remove("data/tmp.zip")
+# # Read the data
+# df_gaz_counties <- read.delim("data/2021_Gaz_counties_national.txt", sep = "\t")
+# write_csv(df_gaz_counties, "data/county_area.csv")
+
+#Coment out above after first run.
+df_gaz_counties <- read_csv("data/county_area.csv", show_col_types = FALSE)
+knitr::kable(tail(df_gaz_counties), caption = "US Census Gazeteer County Data")
+```
+
+#### Build a County level population and land area dataset
+
+This will be joined to the covid dataset to calculate case density and death density.
+
+```{r pop_land_join}
+population_df <- deaths_us_raw %>%
+    select(FIPS, Combined_Key, Population) %>%
+    distinct()
+
+population_df <- population_df %>%
+    left_join(df_gaz_counties %>% select(GEOID, ALAND_SQMI),
+            by = c("FIPS" = "GEOID")) %>%
+    mutate(density = Population / ALAND_SQMI)
+
+knitr::kable(head(population_df), caption = "Population and Land Area per county table")
+```
+
+
+#### Joining the 3 tables 
+
+In this final step in the data preperation, we will join the `confirmed_us`, `deaths_us` and `population_df` tables together. 
+
+Next we need to remove several records from the data that won't be useful to us. These are areas that do not fit into a US county designation. In these cases the county name begins with `Out of <state>` or `Unassigned`. A quick check shows very little population in these areas and it is safe to simply remove them from this analysis.
+
+Finally, we can add to manipulated columns at this point to help us in the next sections. We will create a feature that calcutates the "growth" or "new" case/deaths per day by simply subtacting the difference from the previous day.
+
+```{r main_table_join, results='hide'}
+# Convert date to proper Date format in both datasets before joining
+confirmed_us <- confirmed_us %>%
+    mutate(date = mdy(date, quiet = FALSE))
+
+deaths_us <- deaths_us %>%
+    mutate(date = mdy(date, quiet = FALSE))
+
+covid_df <- confirmed_us %>%
+    full_join((deaths_us))
+
+covid_df <- covid_df %>%
+    left_join((population_df))
+
+covid_df <- covid_df %>%
+    filter(!str_starts(Combined_Key, "Out of|Unassigned"))
+
+# Calculate a "new" value for daily values
+covid_df <- covid_df %>%
+    group_by(Combined_Key) %>%
+    arrange(date) %>%
+    mutate(
+        new_cases = cases - lag(cases, default = 0),
+        new_deaths = deaths - lag(deaths, default = 0)
+    ) %>%
+    ungroup()
+```
+
+### Final Covid Data
+
+The final prepared data. 
+
+```{r summary_of_prep, echo = FALSE, results = 'asis'}
+cat("------------------------Summary-----------------\n\n")
+cat("\t\t\tNumber of rows in the Covid Table:", nrow(covid_df), "\n\n")
+cat("\t\t\tNumber of columns in the Covid Table:", ncol(covid_df), "\n\n")
+
+pander(summary(covid_df))
+knitr::kable(slice_sample(covid_df, n = 5), caption = "Covid DF prepared")
+```
+
+---
+
+# Introductory Exploration of COVID-19 Data
+
+In the following sections we will explore some of the key trends and patterns in the COVID-19 data. This will include visualizations of case and death counts over time and comparisons between regions.
+
+### US Total View
+
+First we will look at an aggregated view of the United States and view the relationship between Covid Cases and Covid Deaths. To do this we will create a new table grouping all counties by date to get a national view.
+
+Additionally, We will convert this US aggregated data into weekly granularity for better visualization and to compare with areas that only reported weekly.
+
+```{r us_total}
+# Group all counties to get a national view by day
+us_covid_df <- covid_df %>%
+    group_by(Country_Region, date) %>%
+    arrange(date) %>%
+    summarize(population = sum(Population),
+        cases = sum(cases),
+        deaths = sum(deaths),
+        new_cases = sum(new_cases),
+        new_deaths = sum(new_deaths),
+        .groups = 'drop') %>%
+    mutate(deaths_per_mill = (deaths * 1000000 / population)) %>%
+    select(Country_Region, date, cases, deaths, deaths_per_mill, population, new_cases, new_deaths) %>%
+    ungroup()
+
+# Convert US data to weekly aggregation for better visualization and to compare with areas that only reported weekly.
+us_covid_weekly <- us_covid_df %>%
+    mutate(week = floor_date(date, "week")) %>%
+    group_by(Country_Region, week) %>%
+    summarize(
+        population = first(population),
+        cases = last(cases),  # Take last value of week for cumulative
+        deaths = last(deaths),
+        new_cases = sum(new_cases),  # Sum daily new cases for the week
+        new_deaths = sum(new_deaths),
+        .groups = 'drop'
+    ) %>%
+    mutate(deaths_per_mill = (deaths * 1000000 / population))
+```
+
+#### US Visualiztions
+
+```{r us_viz, fig.width=12, fig.height=4}
+# Time series plot of new cases and new deaths for the US
+us_timeseries <- plot_ly(us_covid_weekly, x = ~week) %>%
+    add_lines(y = ~new_cases, name = "New Cases", 
+              line = list(color = "blue")) %>%
+    add_lines(y = ~new_deaths, name = "New Deaths", 
+              line = list(color = "red"), 
+              yaxis = "y2") %>%
+    layout(
+        title = "US COVID-19: New Cases and Deaths Over Time",
+        xaxis = list(title = "Date"),
+        yaxis = list(
+            title = "New Cases",
+            side = "left",
+            titlefont = list(color = "blue"),
+            tickfont = list(color = "blue")
+        ),
+        yaxis2 = list(
+            title = "New Deaths",
+            side = "right",
+            overlaying = "y",
+            titlefont = list(color = "red"),
+            tickfont = list(color = "red")
+        ),
+        hovermode = "x unified"
+    )
+
+us_timeseries
+```
+
+##### Reactions
+
+The intial view shows the relationship between covid cases and covid deaths. While there is an unfortunate spike in cases and deaths in January of 2022, we can also see that the ratio of cases to deaths has also decreased by this time. This could be a result of hospitals and communities being better equipped to care for covid patients or the effectiveness of the vacine reduce the mortality rate of the virus.
+
+#### US Aggregated
+
+Next we will look at the same visual in a cumulative form.
+
+```{r us_agg_viz, fig.width=12, fig.height=4}
+# Time series plot of cases and deaths for the US
+us_timeseries_total <- plot_ly(us_covid_df, x = ~date) %>%
+    add_lines(y = ~cases, name = "Cases", 
+              line = list(color = "blue")) %>%
+    add_lines(y = ~deaths, name = "Deaths", 
+              line = list(color = "red"), 
+              yaxis = "y2") %>%
+    layout(
+        title = "US COVID-19: Cases and Deaths Over Time",
+        xaxis = list(title = "Date"),
+        yaxis = list(
+            title = "Cases",
+            side = "left",
+            titlefont = list(color = "blue"),
+            tickfont = list(color = "blue")
+        ),
+        yaxis2 = list(
+            title = "New Deaths",
+            side = "right",
+            overlaying = "y",
+            titlefont = list(color = "red"),
+            tickfont = list(color = "red")
+        ),
+        hovermode = "x unified"
+    )
+
+us_timeseries_total
+```
+
+##### Reactions
+
+This view helps further us understand the relationship between cases and deaths. The gap between the too lines showing us a timeframe where the virus was more deadly.
+
+--- 
+
+### State Vizualizations
+
+```{r state_data}
+# Group counties by state to get a state wide view by date
+state_covid_df <- covid_df %>%
+    group_by(Province_State, date) %>%
+    arrange(date) %>%
+    summarize(population = sum(Population),
+        cases = sum(cases),
+        deaths = sum(deaths),
+        new_cases = sum(new_cases),
+        new_deaths = sum(new_deaths),
+        .groups = 'drop') %>%
+    mutate(deaths_per_mill = (deaths * 1000000 / population)) %>%
+    select(Province_State, date, cases, deaths, deaths_per_mill, population, new_cases, new_deaths) %>%
+    ungroup()
+
+# Convert state data to weekly aggregation
+state_covid_weekly <- state_covid_df %>%
+    mutate(week = floor_date(date, "week")) %>%
+    group_by(Province_State, week) %>%
+    summarize(
+        population = first(population),
+        cases = last(cases),
+        deaths = last(deaths),
+        new_cases = sum(new_cases),
+        new_deaths = sum(new_deaths),
+        .groups = 'drop'
+    ) %>%
+    mutate(deaths_per_mill = (deaths * 1000000 / population))
+```
+
+
+```{r state_function}
+# Function to plot state COVID-19 time series
+plot_state_covid <- function(state_name, data = state_covid_weekly) {
+    # Filter data for the specified state
+    state_data <- data %>% 
+        filter(Province_State == state_name)
+    
+    # Check if state exists in data
+    if(nrow(state_data) == 0) {
+        stop(paste("State", state_name, "not found in data."))
+    }
+    
+    # Create the plot
+    state_plot <- plot_ly(state_data, x = ~week) %>%
+        add_lines(y = ~new_cases, name = "New Cases", 
+                  line = list(color = "blue")) %>%
+        add_lines(y = ~new_deaths, name = "New Deaths", 
+                  line = list(color = "red"), 
+                  yaxis = "y2") %>%
+        layout(
+            title = paste(state_name, "COVID-19: New Cases and Deaths Over Time"),
+            xaxis = list(title = "Date"),
+            yaxis = list(
+                title = "New Cases",
+                side = "left",
+                titlefont = list(color = "blue"),
+                tickfont = list(color = "blue")
+            ),
+            yaxis2 = list(
+                title = "New Deaths",
+                side = "right",
+                overlaying = "y",
+                titlefont = list(color = "red"),
+                tickfont = list(color = "red")
+            ),
+            hovermode = "x unified"
+        )
+    
+    return(state_plot)
+}
+```
+
+Next we will look at this same visualization of the relationship between cases and deaths, but at a state level.  Clearly some states were exposed to the virus earlier than others and perhaps had a much different response to the epidemic. 
+
+We won't examine every state here but get a sense of the variance between several states.
+
+First we will examine the state of New York which saw the earliest spike in cases and deaths. 
+
+**New York**
+```{r new_york, fig.width=12, fig.height=4}
+# Plot NY
+plot_state_covid("New York")
+
+```
+
+##### Reaction
+
+New York saw the earliest exposure to the virus across the country. Given the density of the city and our lack of understand both in care and transmission, we can see an outsized impact on the number of deaths relative to the cases. 
+
+However, By the time the omicron variant surfaced, New York was better prepared for care and its citizens had a higher rate of vacinations relative to the country. Thus, while the covid cases saw another unfortunate spike, this time nearly 5 times higher than any previous spike, the death toll was almost equally 5 times lower than its peak ratio.
+
+Next we will look at another state with fewer overall cases to examine the time and growth rates
+
+**Alabama**
+```{r alabama, fig.width=12, fig.height=4}
+plot_state_covid('Alabama')
+```
+##### Reaction 
+
+Alabama in many shows a similar pattern of a high ratio of deaths upon the first wave of the virus and ultimately much lower fatalities during the high case spike in January of 2022. However, the first wave of infections did come nearly 6 months after New York. Unfortunately the state's medical centers or perhaps its citizens were not able to prepare from NY's learnings. Further, Alabama sees another spike in September of 2021 that is once again highly fatal. 
+
+
+Next lets examine a state with large population but less density
+
+**Illinois**
+```{r illinois, fig.width=12, fig.height=4}
+plot_state_covid('Illinois')
+```
+##### Reaction
+
+Illinois again has some similarities to New York and Alabama, but certainly suffered more later in the epidemic.  Unlike Alabama, Illinois was apart of the first wave of the virus which was very deadly given the lack of understanding and preparation. Then again in January of 2021, Illinois suffered a spike in cases, yet unlike New York was not able to reduce the fatalities relative to the cases. Finally unlike Alabama and New York, the omicron variant in January of 2022 continued to be very fatal to Illinois residents. 
+
+
+
+Finally lets examine an outlier with large population yet low death counts
+
+**Florida**
+```{r florida, fig.width=12, fig.height=4}
+plot_state_covid('Florida')
+```
+##### Reaction
+
+Unsure of the patterns here as Florida looks to be an outlier in how the virus effected residents.  Through the first 20 months of the virus the fatality rates are very low compared to confirmed cases. However, the Omicron variant spike in January of 2022 did turn out to be very fatal.
+
+Another intersting note on the data from Florida is that even though these charts were moved to a weekly granularity there are sawtooth data patterns in March of 2022.  This likely indicates reporting shifts to some counties or hospitals only reporting every 2 weeks. Something to be aware of in the data.
+
+
+---
+
+# Examine the impacts of Population Density on COVID-19 Cases, Deaths, and Growth Rates
+
+In the next sections, we will analyze how population density influences the spread and severity of COVID-19. We will look at correlations between population density and case counts, death counts, and growth rates of infections across different counties and regions. This analysis will help us understand whether more densely populated areas experienced higher rates of infection and mortality during the pandemic.
+
+#### Growth Rate
+
+In order to examine we will look at a rolling **14-day** average growth of cases and deaths per **100,000** people. This will give us a per capita view of how quickly the virus spread in different areas relative to their population size.
+
+
+```{r rollmean}
+
+# use the zoo library with `rollmean` function
+covid_df <- covid_df %>%
+    group_by(Combined_Key) %>%
+    arrange(date) %>%
+    mutate(
+        cases_14d_avg = rollmean(new_cases, k = 14, fill = NA, align = "right"),
+        deaths_14d_avg = rollmean(new_deaths, k = 14, fill = NA, align = "right")
+    ) %>%
+    ungroup()
+```
+
+```{r max_table}
+
+max_covid_df <- covid_df %>%
+    group_by(Combined_Key) %>%
+    summarize(
+        Province_State = first(Province_State),
+        Country_Region = first(Country_Region),
+        Population = first(Population),
+        FIPS = first(FIPS),
+        ALAND_SQMI = first(ALAND_SQMI),
+        density = first(density),
+        max_date = max(date, na.rm = TRUE),
+        total_cases = max(cases, na.rm = TRUE),
+        total_deaths = max(deaths, na.rm = TRUE),
+        peak_new_cases = max(new_cases, na.rm = TRUE),
+        peak_new_deaths = max(new_deaths, na.rm = TRUE),
+        peak_cases_14d_avg = max(cases_14d_avg, na.rm = TRUE),
+        peak_deaths_14d_avg = max(deaths_14d_avg, na.rm = TRUE)
+    ) %>%
+    mutate(
+        cases_per_capita = ifelse(Population == 0 | is.na(Population), 
+                                     0, 
+                                     total_cases*100000/Population),
+        deaths_per_capita = ifelse(Population == 0 | is.na(Population), 
+                                     0, 
+                                     total_deaths*100000/Population),
+        peak_avg_cases_growth_per_capita = ifelse(Population == 0 | is.na(Population), 
+                                     0, 
+                                     peak_cases_14d_avg*100000/Population),
+        peak_avg_deaths_growth_per_capita = ifelse(Population == 0 | is.na(Population), 
+                                     0, 
+                                     peak_deaths_14d_avg*100000/Population),
+        peak_avg_death_rate = ifelse(Population == 0 | is.na(Population), 
+                                     0, 
+                                     peak_deaths_14d_avg*100000/Population)) %>%
+    ungroup()
+```
+
+#### Peak Data
+
+```{r peak_data}
+
+pander(head(max_covid_df %>% select('Combined_Key', 'total_cases', 'total_deaths', 'peak_new_cases', 'peak_cases_14d_avg', 'peak_deaths_14d_avg', 'cases_per_capita' ,'deaths_per_capita','peak_avg_cases_growth_per_capita', 'peak_avg_deaths_growth_per_capita', 'peak_avg_death_rate')))
+```
+
+### Population Density and Death Rate
+
+In this first visual we will examind the population density on a scatter plot. 
+
+In addition to the position on the visual indicating the ratio of population to land mass, we have also added additional information. The size of the marker indicates the Total Cases per Capita, and the color indicates the how fatal the cases were with the peak ratio of deaths during the viruses most aggressive period.
+
+```{r density, echo = FALSE, warning = FALSE, report = 'asis', fig.width=12, fig.height=4}
+# Create scatter plot with population density analysis
+density_scatter <- plot_ly(max_covid_df,
+                           y = ~Population,
+                           x = ~ALAND_SQMI,
+                           size = ~cases_per_capita,
+                           color = ~peak_avg_death_rate,
+                           colors = c("lightblue", "red"),
+                           type = "scatter",
+                           mode = "markers",
+                           text = ~paste("Location:", Combined_Key,
+                                        "<br>Population:", scales::comma(Population),
+                                        "<br>Area (sq mi):", scales::comma(ALAND_SQMI),
+                                        "<br>Max Cases:", scales::comma(total_cases),
+                                        "<br>Peak Death Rate:", round(peak_avg_death_rate, 2)),
+                           hoverinfo = "text",
+                           marker = list(opacity = 0.9,
+                                        line = list(color = "black", width = 0.2))) %>%
+    layout(
+        title = "COVID-19 Impact by Population Density",
+        yaxis = list(title = "Population", type = "log"),
+        xaxis = list(title = "Land Area (Square Miles)", type = "log"),
+        showlegend = TRUE,
+        annotations = list(
+            # High Density annotation (upper left)
+            list(
+                x = 0.05,
+                y = 0.95,
+                text = "High Density",
+                xref = "paper",
+                yref = "paper",
+                showarrow = FALSE,
+                font = list(size = 14, color = "black"),
+                bgcolor = "rgba(255, 255, 255, 0.8)",
+                bordercolor = "black",
+                borderwidth = 1,
+                borderpad = 4
+            ),
+            # Low Density annotation (lower right)
+            list(
+                x = 0.95,
+                y = 0.05,
+                text = "Low Density",
+                xref = "paper",
+                yref = "paper",
+                showarrow = FALSE,
+                font = list(size = 14, color = "black"),
+                bgcolor = "rgba(255, 255, 255, 0.8)",
+                bordercolor = "black",
+                borderwidth = 1,
+                borderpad = 4
+            )
+        )
+    ) %>%
+    colorbar(title = "Peak Death Rate<br>(per 100k)")
+density_scatter
+```
+
+What I can see from this visual is that it is not necessarily high population density that is driving peaks in fatalities or even covid cases per capita. 
+
+#### Peak cases
+
+This chart looks at Population Density on the Y axis and the peak new case growth per capita on the X axis.
+
+Peak New Case Growth is not immediately intuitive, but what we are looking to answer is:
+
+"Did the virus spread faster in counties with high population density?"
+
+```{r peak_cases, echo = FALSE, warning = FALSE, fig.width=12, fig.height=4}
+# Create scatter plot with population density analysis
+peak_cases <- plot_ly(max_covid_df,
+                           x = ~peak_avg_cases_growth_per_capita,
+                           y = ~density,
+                           size = ~total_cases,
+                           color = ~peak_avg_death_rate,
+                           colors = c("lightblue", "red"),
+                           type = "scatter",
+                           mode = "markers",
+                           text = ~paste("Location:", Combined_Key,
+                                        "<br>Population:", scales::comma(Population),
+                                        "<br>Area (sq mi):", scales::comma(ALAND_SQMI),
+                                        "<br>Max Cases:", scales::comma(total_cases),
+                                        "<br>Peak Death Rate:", round(peak_avg_death_rate, 2)),
+                           hoverinfo = "text",
+                           marker = list(opacity = 0.9,
+                                        line = list(color = "black", width = 0.2))) %>%
+    layout(
+        title = "COVID-19 Impact by Population Density",
+        xaxis = list(title = "Peak Case Growth per Capita", type = "log"),
+        yaxis = list(title = "Population Density", type = "log"),
+        showlegend = TRUE
+    ) %>%
+    colorbar(title = "Peak Death Rate<br>(per 100k)")
+
+peak_cases
+```
+
+In the above visual we do not see a linear trend between the x and y variables. Meaning that Population density was not directly correlated with how _fast_ the virus spread.
+
+Additionally, what we might see in this data visualization is a trend that the deaths per 100k residents _was_ higher in low density areas. I think a reasonable hypothesis to explore here would be access to care for the confirmed cases. Larger cities with higher density also have more hospitals and clinics closer to its residents
+
+#### Deaths Per capita
+
+Were deaths per capita greater in high density areas? 
+
+```{r d_p_c, echo = FALSE, warning = FALSE, fig.width=12, fig.height=4}
+# Create scatter plot with population density analysis
+d_p_c <- plot_ly(max_covid_df,
+                           x = ~deaths_per_capita,
+                           y = ~density,
+                           size = ~total_cases,
+                           color = ~peak_avg_death_rate,
+                           colors = c("lightblue", "red"),
+                           type = "scatter",
+                           mode = "markers",
+                           text = ~paste("Location:", Combined_Key,
+                                        "<br>Population:", scales::comma(Population),
+                                        "<br>Area (sq mi):", scales::comma(ALAND_SQMI),
+                                        "<br>Max Cases:", scales::comma(total_cases),
+                                        "<br>Peak Death Rate:", round(peak_avg_death_rate, 2)),
+                           hoverinfo = "text",
+                           marker = list(opacity = 0.9,
+                                        line = list(color = "black", width = 0.2))) %>%
+    layout(
+        title = "COVID-19 Impact by Population Density",
+        xaxis = list(title = "Deaths per Capita", type = "log"),
+        yaxis = list(title = "Population Density", type = "log"),
+        showlegend = TRUE
+    ) %>%
+    colorbar(title = "Peak Death Rate<br>(per 100k)")
+
+d_p_c
+```
+
+This visual also denies any obvious linear correlation to population density and the deaths per capita. 
+
+
+#### Death Growth Rate by Density
+
+Is the peak growth rate of deaths (per capita) related to population density?  In other words were areas with high population density overcome by a wave of the virus that they wer unable to handle? In this case we are looking at a death rate of total cases to deaths.
+
+```{r g_r_d, echo = FALSE, warning = FALSE, fig.width=12, fig.height=4}
+# Create scatter plot with population density analysis
+g_r_d <- plot_ly(max_covid_df,
+                           x = ~peak_avg_deaths_growth_per_capita,
+                           y = ~density,
+                           size = ~total_cases,
+                           color = ~peak_avg_death_rate,
+                           colors = c("lightblue", "red"),
+                           type = "scatter",
+                           mode = "markers",
+                           text = ~paste("Location:", Combined_Key,
+                                        "<br>Population:", scales::comma(Population),
+                                        "<br>Area (sq mi):", scales::comma(ALAND_SQMI),
+                                        "<br>Max Cases:", scales::comma(total_cases),
+                                        "<br>Peak Death Rate:", round(peak_avg_death_rate, 2)),
+                           hoverinfo = "text",
+                           marker = list(opacity = 0.9,
+                                        line = list(color = "black", width = 0.2))) %>%
+    layout(
+        title = "COVID-19 Impact by Population Density",
+        xaxis = list(title = "Peak Case Growth per Capita (How fast was the spread of covid)", type = "log"),
+        yaxis = list(title = "Population Density", type = "log"),
+        showlegend = TRUE
+    ) %>%
+    colorbar(title = "Peak Death Rate<br>(per million)")
+
+g_r_d
+```
+
+This view does present a relationship between Population Density and the peak death rate. Counter-intuitively we see that counties with lower population densities in fact are more correlated to strong peaks in death rate per capita.  
+
+---
+
+# Modeling Features
+
+Next we will quantify any correlation with a linear model to see if density or another feathure has an significant relationship to our target
+
+### Peak Avg Death Rate
+
+The death rate is calculated as the ratio of deaths to cases. In other words, how well were the community and medical facilaties able to handle Covid cases by prevent fatalities. We calculate this as a rolling average of the growth figure to look for spikes in the impact. Meaning was there a spike in cases that also resulted in a high death rate per case. 
+
+We look back over time and find the peak of this ratio and compare it variables such as population, density, total cases or peak new case growth
+
+```{r cor_death_rate}
+model <- lm(peak_avg_death_rate ~ Population + density + total_cases + peak_new_cases,
+             data = max_covid_df)
+
+# Highlight significant p-values in the model summary
+tidy_model <- broom::tidy(model)
+
+# Create color vector that handles NA values
+p_value_colors <- ifelse(is.na(tidy_model$p.value), "black",
+                         ifelse(tidy_model$p.value < 0.05, "red", "black"))
+
+tidy_model %>%
+  knitr::kable(caption = "Model Summary", digits = 4) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  column_spec(5, bold = TRUE, color = p_value_colors) %>%
+  footnote(general = "Red values indicate statistical significance (p < 0.05)")
+```
+
+We can see that with this target variable of Peak Death Rate the overall population and total cases were correlated, but population has a _negative_ coefficient.  Further, we see that density and peak new case is not statistically significant.
+
+
+Next, we will fit a model to look for correlation between both population and density to Deaths per Capita
+
+```{r deaths_per_capita}
+model <- lm(deaths_per_capita ~ Population + density,
+             data = max_covid_df)
+
+# Highlight significant p-values in the model summary
+tidy_model <- broom::tidy(model)
+
+# Create color vector that handles NA values
+p_value_colors <- ifelse(is.na(tidy_model$p.value), "black",
+                         ifelse(tidy_model$p.value < 0.05, "red", "black"))
+
+tidy_model %>%
+  knitr::kable(caption = "Model Summary", digits = 4) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  column_spec(5, bold = TRUE, color = p_value_colors) %>%
+  footnote(general = "Red values indicate statistical significance (p < 0.05)")
+```
+
+Finally, here again, we can see that Population density was not as significantly correlated to deaths per capita.
+
+
+# Conclusion
+
+This analysis examined COVID-19 data across US counties to understand the relationship between population density and virus outcomes. Counter to initial expectations, the data reveals that **population density was not a primary driver of COVID-19 severity**.
+
+### Key Findings
+
+1. **Density and Spread**: No clear linear relationship exists between population density and the rate of virus transmission. High-density urban areas did not consistently experience faster spread than rural counties.
+
+2. **Inverse Mortality Pattern**: Counties with lower population density showed higher peak death rates per capita. This suggests that proximity to healthcare facilities in urban areas may have provided a protective effect that outweighed the risks of density.
+
+3. **Temporal Patterns**: States like New York, which faced early exposure, showed dramatically improved outcomes during later waves, likely due to better treatment protocols and higher vaccination rates. In contrast, states like Alabama and Illinois continued to see elevated fatality ratios throughout the pandemic.
+
+4. **Statistical Significance**: Linear models confirmed that while total population and case counts correlated with outcomes, population density itself was not a statistically significant predictor of deaths per capita.
+
+
+---
+
+# Potential Bias
+
+The original source of the dataset has an LONG list of nuances and caveats to this dataset and its collection. https://github.com/CSSEGISandData/COVID-19.
+
+I will attempt to add a few potential biases of my own here and should be considered when interperting this analysis
+
+### Reporting Inconsistencies
+
+The data shows potential reporting bias across different jurisdictions:
+
+- **Florida's sawtooth pattern** in March 2022 suggests irregular reporting intervals (some counties reporting bi-weekly rather than daily)
+- **Testing availability**: Counties with better healthcare infrastructure likely had higher testing rates, leading to more confirmed cases but potentially lower mortality rates due to earlier detection
+- **Testing Decline**: as the virus became less lethal, fewer individuals used hospitals or clinics to be diagnosed and therefore confirmed cases are likely underreported in the last months of this data.
+
+### Access to Healthcare
+
+Our analysis may be biased by:
+
+- **Rural vs. Urban disparities**: Lower density areas may have had less access to testing, leading to underreported cases spiking the ratio to deaths
+- **Hospital proximity**: The negative correlation between density and death rates may reflect better access to medical care in urban areas rather than inherent differences in virus transmission
+- **Socioeconomic factors**: Not accounted for in this analysis - income, insurance coverage, and employment type likely influenced both exposure and outcomes
+
+### Timeline Effects
+
+- **Vaccine availability**: Later waves occurred after vaccine rollout, confounding our density analysis
+- **Variant differences**: Different COVID variants had varying mortality rates, not captured in our density comparison
+
+
+### FIPS Code Issues
+
+- Manual correction of Kansas City FIPS code suggests potential data quality issues elsewhere in the dataset
+
+---
+
+**Session Info**
+
+```{r}
+pander(sessionInfo())
+```
