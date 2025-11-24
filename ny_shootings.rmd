@@ -57,6 +57,7 @@ cat("Date range:", min(ny_shootings$OCCUR_DATE), "to", max(ny_shootings$OCCUR_DA
 
 ### Data Summary: `NYPD_Shooting_Incident_Data__Historic`
 ```{r}
+knitr::kable(slice_sample(ny_shootings, n = 5), caption = "NYC Shootings Data")
 pander(summary(ny_shootings))
 ```
 
@@ -265,6 +266,30 @@ tidy_model %>%
 In the above output, we can look for features that have a significant impact on the likelihood of a murder given a shooting happened.
 
 Important note is to look for the coefficients and their statistical significance to understand which factors are most influential.
+
+### Interpreting Significant Predictors
+
+The features highlighted in red show statistical significance (p < 0.05), meaning:
+
+- **These factors have a reliable relationship with shooting lethality** that cannot be attributed to random variation
+- **The model is confident** (>95%) that these variables genuinely influence whether a shooting becomes a murder
+- Variables with **positive coefficients increase the odds** of a fatal outcome
+- Variables with **negative coefficients decrease the odds** of a fatal outcome
+
+For example:
+- If `VIC_AGE_GROUP65+` has a positive coefficient and p < 0.05, we can conclude that **victims over 65 are significantly more likely to die from gunshot wounds** compared to the reference age group
+- If `YEAR` has a negative coefficient and p < 0.05, it suggests that **shootings have become less lethal over time**, controlling for other factors
+
+### Limitations of P-Values
+
+While statistical significance indicates a relationship exists, it **does not tell us**:
+
+1. **Causation**: Correlation ≠ causation. These factors may be correlated with lethality without directly causing it
+2. **Practical Significance**: A statistically significant effect may be too small to matter in real-world terms
+3. **Confounding Variables**: Other unmeasured factors may be the true drivers of the relationship
+4. **Model Assumptions**: The conclusions depend on the model being correctly specified
+
+**Example**: If victim race shows significance, this likely reflects systemic inequalities in access to emergency medical care, not inherent biological differences.
 
 ---
 
